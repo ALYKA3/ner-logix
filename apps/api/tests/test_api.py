@@ -31,7 +31,7 @@ def test_vertical_slice():
         assert database_overview.status_code == 200
         assert database_overview.json()["active_engine"] == "SQLite"
         assert {table["name"] for table in database_overview.json()["tables"]} == {
-            "incidents", "reroutes", "driver_events", "risk_snapshots",
+            "incidents", "reroutes", "driver_events", "risk_snapshots", "incident_photos",
         }
 
         route_monitor = client.get("/api/v1/routes/monitor", headers=admin_headers)
@@ -46,6 +46,9 @@ def test_vertical_slice():
         )
         assert photo.status_code == 201
         assert photo.json()["photo_url"].startswith("/uploads/")
+        stored_photo = client.get(photo.json()["photo_url"])
+        assert stored_photo.status_code == 200
+        assert stored_photo.headers["content-type"] == "image/png"
 
         risk = client.post("/api/v1/risk/pre-trip", headers=driver_headers, json={"vehicle_id": "MED-001", "cargo_priority": "CRITICAL"})
         assert risk.status_code == 200

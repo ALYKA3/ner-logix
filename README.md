@@ -88,7 +88,7 @@ The product is a decision-support system, not another GPS tracker. It answers: *
 | Risk engine | Continuous explainable Python scoring using live Open-Meteo/GloFAS, verified incidents and corridor attributes |
 | File evidence | FastAPI multipart upload + static evidence storage |
 | Testing | Pytest + FastAPI TestClient + Next production build |
-| Deployment | Unified Docker image, Render Blueprint, managed PostgreSQL and GitHub auto-deploy |
+| Deployment | Unified Docker image, free Render Blueprint, PostgreSQL evidence storage and GitHub auto-deploy |
 
 ## Architecture
 

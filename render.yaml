@@ -2,11 +2,13 @@ databases:
   - name: ner-logix-db
     databaseName: ner_logix
     user: ner_logix
+    plan: free
 
 services:
   - type: web
     name: ner-logix
     runtime: docker
+    plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
@@ -26,7 +28,3 @@ services:
         value: "24"
       - key: GPS_SIMULATION_ENABLED
         value: "false"
-    disk:
-      name: incident-uploads
-      mountPath: /data
-      sizeGB: 1

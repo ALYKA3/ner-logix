@@ -7,7 +7,7 @@ The production image serves the exported Next.js application, FastAPI REST API, 
 1. Create an empty GitHub repository.
 2. From this project folder, add the GitHub remote and push the `main` branch.
 3. In Render, choose **New → Blueprint** and select the repository.
-4. Render reads `render.yaml`, builds the root `Dockerfile`, provisions PostgreSQL, creates persistent evidence storage and exposes one permanent HTTPS URL.
+4. Render reads `render.yaml`, builds the root `Dockerfile`, provisions free PostgreSQL and exposes one permanent HTTPS URL.
 5. Verify `/health`, `/`, `/admin`, `/driver`, `/field-officer` and `/docs` on that URL.
 
 The Blueprint deploys updates only after GitHub CI checks pass. After deployment, keep the same URL and publish changes with:
@@ -18,7 +18,7 @@ git commit -m "Describe the update"
 git push origin main
 ```
 
-Render rebuilds the application while the managed PostgreSQL database and upload disk remain persistent. Do not delete the Render service/database or create a new service for each update.
+Render rebuilds the application while reports and photo evidence remain in managed PostgreSQL. Do not delete the Render service/database or create a new service for each update.
 
 ## Local development
 
@@ -46,7 +46,7 @@ GitHub Actions repeats these checks on every push and pull request.
 ## Data and security notes
 
 - Render uses managed PostgreSQL; SQLite remains the fast local fallback.
-- The upload disk prevents officer evidence from disappearing during redeploys.
+- Officer evidence is stored in PostgreSQL, so no paid persistent disk is required.
 - Risk snapshots older than the configured retention window are deleted automatically.
 - The three built-in accounts remain demo accounts. Before government/public production, replace automatic role login with a real identity provider and rotate all credentials.
-- A persistent Render disk may require a paid plan. For a free deployment, replace local evidence storage with S3-compatible object storage.
+- The Blueprint uses Render's free plans. Free web services sleep after 15 idle minutes and can take about a minute to wake. Free Render PostgreSQL expires after 30 days, so export or migrate data before expiry.

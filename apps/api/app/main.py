@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, inspect, select, text
@@ -16,7 +17,7 @@ from .config import get_settings
 from .auth import authenticate, create_access_token, current_user, decode_token, require_roles
 from .adapters.live_weather import OpenMeteoAdapter
 from .database import Base, SessionLocal, engine, get_db
-from .models import DriverEvent, Incident, Reroute, RiskSnapshot
+from .models import DriverEvent, Incident, IncidentPhoto, Reroute, RiskSnapshot
 from .schemas import (
     AlternateRouteRequest,
     ApproveRerouteRequest,
@@ -117,7 +118,7 @@ def image_suffix(content: bytes) -> str | None:
     return None
 
 
-def store_image(content: bytes, requested_suffix: str | None = None) -> str:
+def store_image(content: bytes, db: Session, requested_suffix: str | None = None) -> str:
     if not content or len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Photo must be between 1 byte and 5 MB")
     detected_suffix = image_suffix(content)
@@ -129,7 +130,9 @@ def store_image(content: bytes, requested_suffix: str | None = None) -> str:
     if requested_suffix and requested_suffix.lower() not in allowed_suffixes:
         raise HTTPException(status_code=415, detail="Photo extension does not match its file content")
     filename = f"{uuid4().hex}{detected_suffix}"
-    (upload_path / filename).write_bytes(content)
+    media_type = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}[detected_suffix]
+    db.add(IncidentPhoto(filename=filename, media_type=media_type, content=content))
+    db.commit()
     return f"/uploads/{filename}"
 
 
@@ -180,7 +183,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/uploads", StaticFiles(directory=upload_path), name="uploads")
+
+
+@app.get("/uploads/{filename}")
+def incident_photo(filename: str, db: Session = Depends(get_db)) -> Response:
+    photo = db.get(IncidentPhoto, filename)
+    if photo:
+        return Response(content=photo.content, media_type=photo.media_type, headers={"Cache-Control": "public, max-age=86400"})
+    legacy_file = upload_path / Path(filename).name
+    if legacy_file.exists() and legacy_file.is_file():
+        return FileResponse(legacy_file)
+    raise HTTPException(status_code=404, detail="Photo not found")
 
 
 @app.get("/health")
@@ -203,6 +216,7 @@ def database_overview(
         "reroutes": Reroute,
         "driver_events": DriverEvent,
         "risk_snapshots": RiskSnapshot,
+        "incident_photos": IncidentPhoto,
     }
     counts = {name: db.scalar(select(func.count()).select_from(model)) or 0 for name, model in table_models.items()}
     incidents = list(db.scalars(select(Incident).order_by(Incident.id.desc()).limit(5)))
@@ -237,6 +251,11 @@ def database_overview(
                 "name": "risk_snapshots", "rows": counts["risk_snapshots"],
                 "columns": ["id", "road_id", "risk_score", "risk_level", "status", "confidence", "data_status", "data_source", "factors", "observed_at"],
                 "recent": [{"id": item.id, "road": item.road_id, "risk": item.risk_score, "level": item.risk_level, "status": item.status, "confidence": f"{round(item.confidence * 100)}%", "data": item.data_status, "observed": item.observed_at.isoformat()} for item in risk_snapshots],
+            },
+            {
+                "name": "incident_photos", "rows": counts["incident_photos"],
+                "columns": ["filename", "media_type", "content", "created_at"],
+                "recent": [],
             },
         ],
     }
@@ -600,13 +619,14 @@ async def ingest_vehicle_telemetry(
 @app.post("/api/v1/uploads/incident-photo", status_code=201)
 async def upload_incident_photo(
     photo: UploadFile = File(...),
+    db: Session = Depends(get_db),
     _: dict = Depends(require_roles("FIELD_OFFICER")),
 ) -> dict:
     suffix = Path(photo.filename or "photo.jpg").suffix.lower()
     if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
         raise HTTPException(status_code=415, detail="Only JPG, PNG and WebP photos are accepted")
     content = await photo.read()
-    photo_url = store_image(content, suffix)
+    photo_url = store_image(content, db, suffix)
     return {"photo_url": photo_url, "size_bytes": len(content)}
 
 
@@ -624,7 +644,7 @@ async def field_verify(
             header, encoded = payload.photo_data_url.split(",", 1)
             if not header.startswith("data:image/") or ";base64" not in header:
                 raise ValueError
-            photo_url = store_image(base64.b64decode(encoded, validate=True))
+            photo_url = store_image(base64.b64decode(encoded, validate=True), db)
         except (ValueError, binascii.Error) as exc:
             raise HTTPException(status_code=422, detail="Offline photo data is invalid") from exc
     incident = Incident(
