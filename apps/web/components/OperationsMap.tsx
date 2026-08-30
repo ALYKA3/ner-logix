@@ -118,6 +118,9 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
           dashArray: road.status === "BLOCKED" ? "4 7" : undefined,
           className: road.status === "BLOCKED" ? "blocked-road-line" : "risk-road-line",
         }).bindTooltip(`<b>${road.id} · ${road.name}</b><br>Risk ${road.risk_score}/100 · ${road.status}<br>${road.reason}`, { sticky: true, className: "intel-tooltip" });
+        // Render the visible line first. The wider transparent touch target below
+        // must remain above it so route clicks open the Control Room action popup.
+        roadLine.addTo(group);
         if (onRoadBlock && onRoadReopen) {
           const popup = L.DomUtil.create("div", "road-map-action");
           const heading = document.createElement("strong");
@@ -151,7 +154,6 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
             className: "road-touch-target",
           }).bindPopup(popup, { className: "road-action-popup", closeButton: true, minWidth: 245 }).addTo(group);
         }
-        roadLine.addTo(group);
       });
 
       if (currentRoute.length) {
