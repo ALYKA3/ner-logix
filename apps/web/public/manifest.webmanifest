@@ -1,0 +1,10 @@
+{
+  "name": "NER-LOGIX Smart Logistics",
+  "short_name": "NER-LOGIX",
+  "description": "Disaster logistics decision intelligence for North-East India",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07111f",
+  "theme_color": "#06b6d4",
+  "icons": []
+}

@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+**/node_modules
+**/.next
+**/out
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.db
+**/uploads
+.runtime
+outputs
+work
+*.zip
