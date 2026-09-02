@@ -149,8 +149,22 @@ class LiveRiskEngine:
             if adapter is None or live_count or not self._roads:
                 self._roads = calculated
             else:
-                now = datetime.now(timezone.utc).isoformat()
-                self._roads = [{**road, "data_status": "STALE", "last_evaluated": now} for road in self._roads]
+                # Preserve the last weather observation, but always recalculate
+                # the incident overlay. Keeping the complete old road objects
+                # here made production ignore new closures and reopenings whenever
+                # every external feed timed out.
+                previous_by_id = {road["id"]: road for road in self._roads}
+                stale_roads = []
+                for road in corridor_roads:
+                    previous = previous_by_id.get(road["id"], {})
+                    previous_weather = previous.get("provenance", {}).get("weather", {})
+                    stale_weather = {
+                        **previous_weather,
+                        "data_status": "STALE",
+                        "source": previous.get("data_source", previous_weather.get("source", "Last known live observation")),
+                    }
+                    stale_roads.append(calculate_road_risk(road, stale_weather, incidents))
+                self._roads = stale_roads
             self.last_refresh = datetime.now(timezone.utc).isoformat()
             self.last_error = None if live_count else "All external live feeds unavailable"
             return self._roads
