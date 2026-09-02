@@ -51,6 +51,24 @@ class AlternateRouteRequest(BaseModel):
     avoid_road_ids: list[str] = Field(default_factory=lambda: ["R-02"])
 
 
+class RoadBlockRequest(BaseModel):
+    vehicle_id: str = "MED-001"
+    start_node: str = "A"
+    destination_node: str = "F"
+    description: str = Field(
+        default="Road blocked directly from the Control Room map after a verified safety report",
+        min_length=3,
+        max_length=1000,
+    )
+
+
+class ConfirmFieldReportRequest(BaseModel):
+    road_id: str
+    vehicle_id: str = "MED-001"
+    start_node: str = "A"
+    destination_node: str = "F"
+
+
 class ApproveRerouteRequest(BaseModel):
     approved_by: str = "Assam Control Room"
 

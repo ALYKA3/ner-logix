@@ -4,28 +4,45 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, CloudOff, Gauge, Headphones, LogOut, MapPin, Navigation, PhoneCall, Radio, Route, ShieldCheck, Siren, Truck, Volume2 } from "lucide-react";
 import OperationsMap from "@/components/OperationsMap";
+import LanguageSwitcher from "@/components/LanguageSwitcher";
+import OfflineQueuePanel from "@/components/OfflineQueuePanel";
 import PwaRegister from "@/components/PwaRegister";
 import RoleGuard from "@/components/RoleGuard";
 import { api, connectFleetSocket, getBootstrap } from "@/lib/api";
 import { pendingCount, postOrQueue } from "@/lib/offline";
-import type { Bootstrap, Reroute, Vehicle } from "@/lib/types";
+import {translate,translateValue,type AppLanguage} from "@/lib/i18n";
+import type { Bootstrap, Reroute, RouteExposure, Vehicle } from "@/lib/types";
 
 export default function DriverPage() {
   const router = useRouter();
   const [data, setData] = useState<Bootstrap | null>(null);
   const [vehicle, setVehicle] = useState<Vehicle | null>(null);
   const [reroute, setReroute] = useState<Reroute | null>(null);
-  const [view, setView] = useState<"route"|"report"|"success">("route");
-  const [message, setMessage] = useState("Standing water is making the road unsafe");
+  const [view, setView] = useState<"route"|"report"|"success"|"offline">("route");
+  const [message, setMessage] = useState("");
   const [notice, setNotice] = useState("Connected to Assam Control Room");
   const [online, setOnline] = useState(true);
   const [pending, setPending] = useState(0);
   const [sosConfirm, setSosConfirm] = useState(false);
   const [gpsActive, setGpsActive] = useState(false);
+  const [routeExposure, setRouteExposure] = useState<RouteExposure | null>(null);
+  const [language,setLanguage]=useState<AppLanguage>("en");
   const gpsWatch = useRef<number | null>(null);
 
   useEffect(() => {
-    getBootstrap().then((bootstrap) => { setData(bootstrap); setVehicle(bootstrap.vehicle); setReroute(bootstrap.reroute); });
+    let disposed=false;
+    let bootstrapRetry=0;
+    const storedLanguage=(localStorage.getItem("ner_language") as AppLanguage)||"en";
+    setLanguage(storedLanguage); setMessage(translate(storedLanguage,"defaultUnsafeMessage"));
+    const loadDriver=()=>getBootstrap().then((bootstrap) => {
+      if(disposed)return;
+      setData(bootstrap); setVehicle(bootstrap.vehicle); setReroute(bootstrap.reroute); setRouteExposure(bootstrap.route_exposure||null);
+    }).catch((error)=>{
+      if(disposed)return;
+      setNotice(error instanceof Error?`${error.message} Retrying…`:"Unable to load mission. Retrying…");
+      bootstrapRetry=window.setTimeout(loadDriver,1500);
+    });
+    loadDriver();
     const socket = connectFleetSocket((event) => {
       if (event.type === "vehicle.location" || event.type === "connected") setVehicle(event.data);
       if (event.type === "fleet.snapshot" || event.type === "simulation.started") {
@@ -38,12 +55,23 @@ export default function DriverPage() {
       if (event.type === "roads.risk_updated") setData((current)=>current ? {...current, roads:event.data} : current);
       if (event.type === "incident.created" || event.type === "field.verification") setData((current)=>current ? {...current,incidents:[event.data,...current.incidents.filter(item=>item.id!==event.data.id)]} : current);
       if (event.type === "incident.resolved") setData((current)=>current ? {...current,incidents:current.incidents.filter(item=>item.id!==event.data.id)} : current);
-      if (event.type.startsWith("reroute.")) { setReroute(event.data); setNotice(event.type === "reroute.approved" ? "New route approved by Control Room" : "Route status updated"); }
+      if (event.type === "reroute.reset") { setReroute(null); setRouteExposure(null); setNotice("Previous route decision cleared; monitoring the current mission."); }
+      else if (event.type.startsWith("reroute.")) { setReroute(event.data); setNotice(event.type === "reroute.approved" ? "New route approved by Control Room" : "Route status updated"); }
+      if (event.type === "road.reopened") setRouteExposure((current)=>current?.road_id===event.data.road_id?null:current);
+      if (event.type === "route.hazard_ahead") {
+        const exposure:RouteExposure=event.data;
+        setRouteExposure(exposure); if(exposure.reroute)setReroute(exposure.reroute);
+        setNotice(`${exposure.urgency}: ${exposure.road_id} hazard ${exposure.distance_ahead_km} km ahead. ${exposure.action.replaceAll("_"," ")}.`);
+      }
     });
     const updateNetwork = () => { setOnline(navigator.onLine); pendingCount().then(setPending); };
-    updateNetwork(); window.addEventListener("online", updateNetwork); window.addEventListener("offline", updateNetwork);
-    return () => { socket.close(); if(gpsWatch.current!==null) navigator.geolocation.clearWatch(gpsWatch.current); window.removeEventListener("online", updateNetwork); window.removeEventListener("offline", updateNetwork); };
+    updateNetwork(); window.addEventListener("online", updateNetwork); window.addEventListener("offline", updateNetwork); window.addEventListener("ner-offline-queue-change",updateNetwork);
+    return () => { disposed=true; window.clearTimeout(bootstrapRetry); socket.close(); if(gpsWatch.current!==null) navigator.geolocation.clearWatch(gpsWatch.current); window.removeEventListener("online", updateNetwork); window.removeEventListener("offline", updateNetwork); window.removeEventListener("ner-offline-queue-change",updateNetwork); };
   }, []);
+
+  const changeLanguage=(next:AppLanguage)=>{setLanguage(next);setMessage(translate(next,"defaultUnsafeMessage"));localStorage.setItem("ner_language",next)};
+  const t=(key:string)=>translate(language,key);
+  const tv=(value:string|undefined|null)=>translateValue(language,value);
 
   function startLiveGps() {
     if (!navigator.geolocation) { setNotice("This device does not expose GPS."); return; }
@@ -71,7 +99,7 @@ export default function DriverPage() {
   async function reportUnsafe() {
     try {
       const result: any = await postOrQueue("/api/v1/driver/MED-001/reports", { message, lat: vehicle?.lat, lng: vehicle?.lng });
-      setNotice(result.queued ? "Saved offline. Report will sync automatically." : "Unsafe-road report sent to Control Room.");
+      setNotice(result.queued ? t("savedOfflineDriver") : "Unsafe-road report sent to Control Room.");
       setPending(await pendingCount()); setView("success");
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to submit unsafe-road report"); }
   }
@@ -100,45 +128,47 @@ export default function DriverPage() {
   const remainingDistance = reroute ? Math.max(.1,reroute.distance_km*(1-routeProgress/100)) : 0;
   const remainingEta = reroute ? Math.max(1,Math.round(reroute.eta_minutes*(1-routeProgress/100))) : vehicle?.eta_minutes || 0;
   return <RoleGuard role="DRIVER"><main className="mobile-workspace driver-workspace"><PwaRegister/>
-    <header className="mobile-header"><div className="mobile-brand"><Truck/><span><b>NER-LOGIX DRIVER</b><small>MED-001 · Critical Medicines</small></span></div><button onClick={()=>router.push("/")} aria-label="Sign out"><LogOut/></button></header>
-    <div className="connectivity"><span className={online?"online":"offline"}>{online?<Radio/>:<CloudOff/>}{online?`Online · ${gpsActive||vehicle?.telemetry_source==="DEVICE_GPS"?"device GPS live":"GPS not started"}`:"Offline mode"}</span><span>{pending} pending sync</span></div>
+    <header className="mobile-header"><div className="mobile-brand"><Truck/><span><b>{t("driverTitle")}</b><small>{t("driverSubtitle")}</small></span></div><div className="mobile-header-actions"><LanguageSwitcher language={language} onChange={changeLanguage}/><button onClick={()=>router.push("/")} aria-label="Sign out"><LogOut/></button></div></header>
+    <div className="connectivity"><span className={online?"online":"offline"}>{online?<Radio/>:<CloudOff/>}{online?`${t("online").split(" · ")[0]} · ${gpsActive||vehicle?.telemetry_source==="DEVICE_GPS"?t("deviceGpsLive"):t("gpsNotStarted")}`:t("offline")}</span><button className="pending-sync-link" onClick={()=>setView("offline")}>{pending} {t("pending")}</button></div>
+
+    {view==="offline"&&<section className="offline-page"><button className="back-button" onClick={()=>setView("route")}><ArrowLeft/>{t("returnRoute")}</button><OfflineQueuePanel language={language}/></section>}
 
     {view === "route" && navigating && vehicle && data && reroute && <section className="driver-navigation">
       <div className="navigation-stage">
-        <OperationsMap navigation compact vehicle={vehicle} roads={data.roads} incidents={data.incidents} reroute={reroute} currentRoute={[]}/>
-        <div className="turn-card"><span className="turn-icon"><Navigation/></span><div><small>NEXT SAFE WAYPOINT</small><b>Continue towards {nextStop}</b><p>{remainingDistance.toFixed(1)} km remaining on approved corridor</p></div><button aria-label="Voice navigation"><Volume2/></button></div>
-        <div className="navigation-status"><span><i/>LIVE GPS</span><b>{Math.round(vehicle.speed_kmph)} <small>km/h</small></b></div>
+        <OperationsMap navigation compact vehicle={vehicle} roads={data.roads} incidents={data.incidents} reroute={null} currentRoute={reroute.coordinates}/>
+        <div className="turn-card"><span className="turn-icon"><Navigation/></span><div><small>{t("nextWaypoint")}</small><b>{t("continueTowards")} {tv(nextStop)}</b><p>{remainingDistance.toFixed(1)} {t("remainingApproved")}</p></div><button aria-label="Voice navigation"><Volume2/></button></div>
+        <div className="navigation-status"><span><i/>{t("liveGps")}</span><b>{Math.round(vehicle.speed_kmph)} <small>km/h</small></b></div>
       </div>
       <div className="trip-sheet">
         <div className="sheet-handle"/>
-        <div className="trip-destination"><span><MapPin/></span><div><small>DESTINATION</small><h1>{vehicle.destination}</h1><p>{vehicle.cargo} · <b>CRITICAL DELIVERY</b></p></div></div>
-        <div className="trip-primary-metrics"><span><Clock3/><div><b>{remainingEta} min</b><small>ETA {new Date(Date.now()+remainingEta*60000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</small></div></span><span><Route/><div><b>{remainingDistance.toFixed(1)} km</b><small>{routeProgress}% route complete</small></div></span><span><ShieldCheck/><div><b className="safe-text">{reroute.risk_score}/100</b><small>LOWER RISK</small></div></span></div>
+        <div className="trip-destination"><span><MapPin/></span><div><small>{t("destination")}</small><h1>{tv(vehicle.destination)}</h1><p>{tv(vehicle.cargo)} · <b>{t("criticalDelivery")}</b></p></div></div>
+        <div className="trip-primary-metrics"><span><Clock3/><div><b>{remainingEta} min</b><small>{t("eta")} {new Date(Date.now()+remainingEta*60000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</small></div></span><span><Route/><div><b>{remainingDistance.toFixed(1)} km</b><small>{routeProgress}% {t("routeComplete")}</small></div></span><span><ShieldCheck/><div><b className="safe-text">{reroute.risk_score}/100</b><small>{t("lowerRisk")}</small></div></span></div>
         <div className="route-progress"><i style={{width:`${routeProgress}%`}}/><span className="progress-truck" style={{left:`calc(${routeProgress}% - 9px)`}}><Truck/></span></div>
-        <div className="route-detail-line"><span><Radio/>Approved by {reroute.approved_by||"Control Room"}</span><span><Gauge/>{vehicle.telemetry_source?.replaceAll("_"," ")}</span></div>
-        <button className="route-details-button" onClick={()=>setNotice(`${reroute.route_name} · ${reroute.reason}`)}><Route/>VIEW FULL ROUTE DETAILS</button>
-        {!gpsActive && vehicle.telemetry_source!=="DEVICE_GPS" && vehicle.telemetry_source!=="DEMO_GPS_REPLAY" && <button className="driver-primary gps-button" onClick={startLiveGps}><Navigation/> START DEVICE GPS</button>}
-        <div className="navigation-actions"><button onClick={()=>setView("report")}><AlertTriangle/>REPORT UNSAFE</button><button onClick={()=>setNotice("Calling Assam Control Room…")}><PhoneCall/>CONTROL ROOM</button><button className="sos" onClick={()=>setSosConfirm(true)}><Siren/>SOS</button></div>
-        <div className="driver-note"><Headphones/><span>{notice}</span></div>
+        <div className="route-detail-line"><span><Radio/>{t("approvedBy")} {tv(reroute.approved_by||"Control Room")}</span><span><Gauge/>{tv(vehicle.telemetry_source?.replaceAll("_"," "))}</span></div>
+        <button className="route-details-button" onClick={()=>setNotice(`${tv(reroute.route_name)} · ${tv(reroute.reason)}`)}><Route/>{t("viewRouteDetails")}</button>
+        {!gpsActive && vehicle.telemetry_source!=="DEVICE_GPS" && vehicle.telemetry_source!=="DEMO_GPS_REPLAY" && <button className="driver-primary gps-button" onClick={startLiveGps}><Navigation/> {t("startGps")}</button>}
+        <div className="navigation-actions"><button onClick={()=>setView("report")}><AlertTriangle/>{t("reportUnsafe")}</button><button onClick={()=>setNotice(t("callingControlRoom"))}><PhoneCall/>{t("controlRoom")}</button><button className="sos" onClick={()=>setSosConfirm(true)}><Siren/>SOS</button></div>
+        <div className="driver-note"><Headphones/><span>{tv(notice)}</span></div>
       </div>
     </section>}
 
     {view === "route" && !navigating && <>
       <section className={`instruction-banner ${routeApproved?"approved":"warning"}`}>
-        {routeApproved?<CheckCircle2/>:<AlertTriangle/>}<div><b>{routeApproved?"NEW ROUTE APPROVED":hazardRoad?"ROAD RISK AHEAD":"LIVE MONITORING"}</b><p>{routeApproved?`Approved by ${reroute?.approved_by||"Control Room"}`:hazardRoad?`${hazardRoad.id} · ${hazardRoad.reason}`:"No high-risk signal on the monitored corridor."}</p></div>
+        {routeApproved?<CheckCircle2/>:<AlertTriangle/>}<div><b>{routeApproved?t("newRouteApproved"):routeExposure?`${tv(routeExposure.urgency)} · ${t("roadRiskAhead")} · ${routeExposure.distance_ahead_km} km`:hazardRoad?t("roadRiskAhead"):t("liveMonitoring")}</b><p>{routeApproved?`${t("approvedBy")} ${tv(reroute?.approved_by||"Control Room")}`:routeExposure?`${routeExposure.road_id} · ${tv(routeExposure.action.replaceAll("_"," "))}`:hazardRoad?`${hazardRoad.id} · ${tv(hazardRoad.reason)}`:t("noRiskSignal")}</p></div>
       </section>
-      {vehicle && data && <section className="mobile-map-card"><OperationsMap compact vehicle={vehicle} roads={data.roads} incidents={data.incidents} reroute={reroute} currentRoute={data.current_route}/><div className="next-action"><Navigation/><span><small>NEXT SAFE ACTION</small><b>{routeApproved?reroute?.route_name:hazardRoad?`Wait for authority decision on ${hazardRoad.id}`:"Continue with live monitoring"}</b></span></div></section>}
-      <section className="mission-card"><div className="mission-heading"><span><small>MISSION</small><b>MED-001</b></span><strong>CRITICAL</strong></div><h2>{vehicle?.cargo}</h2><p>Destination · {vehicle?.destination}</p><div className="mission-metrics"><span><small>ETA</small><b>{reroute?.eta_minutes ?? vehicle?.eta_minutes ?? "—"} min</b></span><span><small>DISTANCE</small><b>{reroute?`${reroute.distance_km} km`:"—"}</b></span><span><small>SPEED</small><b>{vehicle?.speed_kmph ?? 0} km/h</b></span><span><small>ROUTE RISK</small><b className={routeApproved?"safe-text":"warning-text"}>{reroute?.risk_score ?? liveRouteRisk ?? "—"}/100</b></span></div></section>
-      {reroute && <section className="route-approval-card"><ShieldCheck/><div><small>AUTHORITY DECISION</small><b>{reroute.status.replaceAll("_"," ")}</b><p>Latest route risk {reroute.risk_score}/100 · ETA {reroute.eta_minutes} min</p></div></section>}
-      {!gpsActive && vehicle?.telemetry_source!=="DEVICE_GPS" && <button className="driver-primary gps-button" onClick={startLiveGps}><Navigation/> START DEVICE GPS</button>}
-      <button className="driver-primary" disabled={!routeApproved || reroute?.status === "DRIVER_ACCEPTED"} onClick={acceptRoute}>{reroute?.status === "DRIVER_ACCEPTED"?"ROUTE ACCEPTED":"ACCEPT APPROVED ROUTE"}</button>
-      <div className="driver-actions"><button onClick={()=>setView("report")}><AlertTriangle/>REPORT UNSAFE</button><button onClick={()=>setNotice("Calling Assam Control Room…")}><PhoneCall/>CALL CONTROL ROOM</button><button className="sos" onClick={()=>setSosConfirm(true)}><Siren/>SOS</button></div>
-      <div className="driver-note"><Headphones/><span>{notice}</span></div>
+      {vehicle && data && <section className="mobile-map-card"><OperationsMap compact vehicle={vehicle} roads={data.roads} incidents={data.incidents} reroute={reroute} currentRoute={data.current_route}/><div className="next-action"><Navigation/><span><small>{t("nextSafeAction")}</small><b>{routeApproved?tv(reroute?.route_name):hazardRoad?`${t("waitDecision")} ${hazardRoad.id}`:t("continueMonitoring")}</b></span></div></section>}
+      <section className="mission-card"><div className="mission-heading"><span><small>{t("mission")}</small><b>MED-001</b></span><strong>{t("critical")}</strong></div><h2>{tv(vehicle?.cargo)}</h2><p>{t("destination")} · {tv(vehicle?.destination)}</p><div className="mission-metrics"><span><small>{t("eta")}</small><b>{reroute?.eta_minutes ?? vehicle?.eta_minutes ?? "—"} min</b></span><span><small>{t("distance")}</small><b>{reroute?`${reroute.distance_km} km`:"—"}</b></span><span><small>{t("speed")}</small><b>{vehicle?.speed_kmph ?? 0} km/h</b></span><span><small>{t("routeRisk")}</small><b className={routeApproved?"safe-text":"warning-text"}>{reroute?.risk_score ?? liveRouteRisk ?? "—"}/100</b></span></div></section>
+      {reroute && <section className="route-approval-card"><ShieldCheck/><div><small>{t("authorityDecision")}</small><b>{tv(reroute.status.replaceAll("_"," "))}</b><p>{t("latestRouteRisk")} {reroute.risk_score}/100 · {t("eta")} {reroute.eta_minutes} min</p></div></section>}
+      {!gpsActive && vehicle?.telemetry_source!=="DEVICE_GPS" && <button className="driver-primary gps-button" onClick={startLiveGps}><Navigation/> {t("startGps")}</button>}
+      <button className="driver-primary" disabled={!routeApproved || reroute?.status === "DRIVER_ACCEPTED"} onClick={acceptRoute}>{reroute?.status === "DRIVER_ACCEPTED"?t("routeAccepted"):t("acceptRoute")}</button>
+      <div className="driver-actions"><button onClick={()=>setView("report")}><AlertTriangle/>{t("reportUnsafe")}</button><button onClick={()=>setNotice(t("callingControlRoom"))}><PhoneCall/>{t("callControlRoom")}</button><button className="sos" onClick={()=>setSosConfirm(true)}><Siren/>SOS</button></div>
+      <div className="driver-note"><Headphones/><span>{tv(notice)}</span></div>
     </>}
 
-    {view === "report" && <section className="mobile-form-page"><button className="back-button" onClick={()=>setView("route")}><ArrowLeft/>Back to route</button><h1>Report Unsafe Road</h1><p>Share the condition ahead. Your live location will be attached.</p><label>Incident type<select><option>Flood / Waterlogging</option><option>Landslide</option><option>Road blockage</option><option>Bridge damage</option></select></label><label>Severity<select><option>High</option><option>Critical</option><option>Medium</option></select></label><label>Description<textarea value={message} onChange={(event)=>setMessage(event.target.value)} rows={5}/></label><div className="location-chip"><Navigation/>GPS {vehicle?.lat.toFixed(4)}, {vehicle?.lng.toFixed(4)} · {vehicle?.telemetry_source || "NO DEVICE FIX"} {vehicle?.accuracy_m?`· accuracy ±${Math.round(vehicle.accuracy_m)} m`:""}</div><button className="driver-primary" onClick={reportUnsafe}>SEND REPORT</button></section>}
+    {view === "report" && <section className="mobile-form-page"><button className="back-button" onClick={()=>setView("route")}><ArrowLeft/>{t("returnRoute")}</button><h1>{t("reportUnsafe")}</h1><p>{t("reportHelp")}</p><label>{t("inspectionType")}<select><option>{t("incidentFlood")}</option><option>{t("incidentLandslide")}</option><option>{t("incidentBlockage")}</option><option>{t("incidentBridge")}</option></select></label><label>{t("severity")}<select><option>{t("high")}</option><option>{t("critical")}</option><option>{t("medium")}</option></select></label><label>{t("description")}<textarea value={message} onChange={(event)=>setMessage(event.target.value)} rows={5}/></label><div className="location-chip"><Navigation/>GPS {vehicle?.lat.toFixed(4)}, {vehicle?.lng.toFixed(4)} · {tv((vehicle?.telemetry_source || "NO DEVICE FIX").replaceAll("_"," "))} {vehicle?.accuracy_m?`· accuracy ±${Math.round(vehicle.accuracy_m)} m`:""}</div><button className="driver-primary" onClick={reportUnsafe}>{t("sendReport")}</button></section>}
 
-    {view === "success" && <section className="success-screen"><CheckCircle2/><h1>Report submitted</h1><p>{notice}</p><button className="driver-primary" onClick={()=>setView("route")}>RETURN TO ROUTE</button></section>}
+    {view === "success" && <section className="success-screen"><CheckCircle2/><h1>{t("reportSubmitted")}</h1><p>{tv(notice)}</p>{pending>0&&<button className="secondary-button queue-view-button" onClick={()=>setView("offline")}>{t("offlineQueue")}</button>}<button className="driver-primary" onClick={()=>setView("route")}>{t("returnRoute")}</button></section>}
 
-    {sosConfirm && <div className="modal-backdrop"><div className="sos-modal"><Siren/><h2>Send emergency SOS?</h2><p>Your live location, vehicle ID and mission details will be sent to the Control Room.</p><button className="sos-confirm" onClick={sendSos}>PRESS TO CONFIRM SOS</button><button className="secondary-button" onClick={()=>setSosConfirm(false)}>CANCEL</button></div></div>}
+    {sosConfirm && <div className="modal-backdrop"><div className="sos-modal"><Siren/><h2>{t("sosTitle")}</h2><p>{t("sosDescription")}</p><button className="sos-confirm" onClick={sendSos}>{t("confirmSos")}</button><button className="secondary-button" onClick={()=>setSosConfirm(false)}>{t("cancel")}</button></div></div>}
   </main></RoleGuard>;
 }

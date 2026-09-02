@@ -12,6 +12,7 @@ VEHICLE_PATH = [
     (26.1021, 92.1124), (26.1300, 92.1240), (26.1580, 92.1360),
     (26.1810, 92.1452),
 ]
+DEFAULT_ROUTE_ROAD_IDS = ["R-01", "R-04", "R-07"]
 
 
 class FleetState:
@@ -25,6 +26,8 @@ class FleetState:
         self.accuracy_m: float | None = None
         self.status_override: str | None = None
         self.updated_at = datetime.now(timezone.utc).isoformat()
+        self.assigned_route_coordinates = [[lat, lng] for lat, lng in VEHICLE_PATH]
+        self.assigned_route_road_ids = list(DEFAULT_ROUTE_ROAD_IDS)
 
     def vehicle(self) -> dict:
         lat, lng = self.current_position
@@ -77,6 +80,15 @@ class FleetState:
         self.updated_at = datetime.now(timezone.utc).isoformat()
         return self.vehicle()
 
+    def apply_reroute(self, coordinates: list[list[float]], road_ids: list[str]) -> dict:
+        self.assigned_route_coordinates = coordinates
+        self.assigned_route_road_ids = road_ids
+        self.status_override = None
+        self.reroute_status = "REROUTED"
+        self.last_instruction = "Following the approved risk-aware reroute"
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.vehicle()
+
 
 fleet_state = FleetState()
 
@@ -114,6 +126,7 @@ def _smooth_path(points: list[list[float]], steps: int = 9) -> list[tuple[float,
 class DemoFleetReplay:
     def __init__(self) -> None:
         self.running = False
+        self.paused = False
         self.vehicle_count = 0
         self.source_node = "A"
         self.destination_node = "F"
@@ -121,6 +134,9 @@ class DemoFleetReplay:
         self.path: list[tuple[float, float]] = []
         self.route_coordinates: list[list[float]] = []
         self.route_distance_km = 0.0
+        self.route_road_ids: list[str] = []
+        self.reroute_status = "MONITORING"
+        self.last_instruction = "Proceed on the safest assigned route"
         self.indices: list[int] = []
         self.updated_at: str | None = None
 
@@ -132,12 +148,14 @@ class DemoFleetReplay:
         interval_seconds: float,
         route_coordinates: list[list[float]] | None = None,
         route_distance_km: float | None = None,
+        route_road_ids: list[str] | None = None,
     ) -> dict:
         if source_node == destination_node:
             raise ValueError("Source and destination must be different")
         route = safest_route(source_node, destination_node, [])
         self.route_coordinates = route_coordinates or route["coordinates"]
         self.route_distance_km = route_distance_km or route["distance_km"]
+        self.route_road_ids = route_road_ids or route["road_ids"]
         self.path = _smooth_path(self.route_coordinates)
         self.vehicle_count = vehicle_count
         self.source_node = source_node
@@ -146,16 +164,20 @@ class DemoFleetReplay:
         spacing = max(1, len(self.path) // max(vehicle_count, 1))
         self.indices = [(index * spacing) % len(self.path) for index in range(vehicle_count)]
         self.running = True
+        self.paused = False
+        self.reroute_status = "MONITORING"
+        self.last_instruction = "Proceed on the safest assigned route"
         self.updated_at = datetime.now(timezone.utc).isoformat()
         return self.snapshot()
 
     def stop(self) -> dict:
         self.running = False
+        self.paused = False
         self.updated_at = datetime.now(timezone.utc).isoformat()
         return self.status()
 
     def tick(self) -> dict:
-        if self.running and self.path:
+        if self.running and not self.paused and self.path:
             self.indices = [(index + 1) % len(self.path) for index in self.indices]
             self.updated_at = datetime.now(timezone.utc).isoformat()
         return self.snapshot()
@@ -177,12 +199,12 @@ class DemoFleetReplay:
                 "priority": priority,
                 "lat": lat,
                 "lng": lng,
-                "speed_kmph": 38 + (position % 3) * 4,
-                "status": "DEMO_REPLAY",
+                "speed_kmph": 0 if self.paused else 38 + (position % 3) * 4,
+                "status": "HOLD_POSITION" if self.paused else "DEMO_REPLAY",
                 "destination": destination_name,
                 "eta_minutes": max(1, round(remaining_km / (38 + (position % 3) * 4) * 60)),
-                "reroute_status": "MONITORING",
-                "last_instruction": f"Demo replay: {NODES[self.source_node][2]} to {destination_name}",
+                "reroute_status": self.reroute_status,
+                "last_instruction": self.last_instruction,
                 "updated_at": self.updated_at,
                 "telemetry_source": "DEMO_GPS_REPLAY",
                 "accuracy_m": None,
@@ -192,18 +214,86 @@ class DemoFleetReplay:
     def status(self) -> dict:
         return {
             "running": self.running,
+            "paused": self.paused,
             "vehicle_count": self.vehicle_count,
             "source_node": self.source_node,
             "source_name": NODES[self.source_node][2],
             "destination_node": self.destination_node,
             "destination_name": NODES[self.destination_node][2],
             "interval_seconds": self.interval_seconds,
+            "route_road_ids": self.route_road_ids,
             "updated_at": self.updated_at,
             "label": "DEMO GPS REPLAY",
         }
 
+    def pause_for_reroute(self, road_id: str) -> dict:
+        if self.running:
+            self.paused = True
+            self.reroute_status = "PENDING_APPROVAL"
+            self.last_instruction = f"STOP: {road_id} is blocked. Await the approved safer route."
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.snapshot()
+
+    def mark_awaiting_driver(self) -> dict:
+        if self.running:
+            self.paused = True
+            self.reroute_status = "AWAITING_DRIVER"
+            self.last_instruction = "Safer route approved; awaiting driver acceptance"
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.snapshot()
+
+    def mark_no_safe_route(self) -> dict:
+        if self.running:
+            self.paused = True
+            self.reroute_status = "NO_SAFE_ROUTE"
+            self.last_instruction = "No safe route remains; hold at a verified safe point"
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.snapshot()
+
+    def resume_current_route(self) -> dict:
+        if self.running:
+            self.paused = False
+            self.reroute_status = "MONITORING"
+            self.last_instruction = "Closure cleared; continue on the optimized route"
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.snapshot()
+
+    def apply_reroute(self, coordinates: list[list[float]], distance_km: float, road_ids: list[str] | None = None) -> dict:
+        previous_positions = [self.path[index] for index in self.indices] if self.path and self.indices else []
+        self.route_coordinates = coordinates
+        self.route_distance_km = distance_km
+        if road_ids is not None:
+            self.route_road_ids = road_ids
+        self.path = _smooth_path(coordinates)
+        self.indices = [
+            min(range(len(self.path)), key=lambda index: (self.path[index][0] - position[0]) ** 2 + (self.path[index][1] - position[1]) ** 2)
+            for position in previous_positions
+        ] or [0 for _ in range(max(1, self.vehicle_count))]
+        self.paused = False
+        self.reroute_status = "REROUTED"
+        self.last_instruction = "Following the approved risk-aware reroute"
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+        return self.snapshot()
+
+    def nearest_node_for_vehicle(self, vehicle_id: str = "MED-001") -> str:
+        position = 0
+        for index, template in enumerate(VEHICLE_TEMPLATES[:max(1, self.vehicle_count)]):
+            if template[0] == vehicle_id:
+                position = index
+                break
+        if self.path and self.indices:
+            lat, lng = self.path[self.indices[min(position, len(self.indices) - 1)]]
+        else:
+            lat, lng = NODES[self.source_node][0], NODES[self.source_node][1]
+        return min(NODES, key=lambda node: (NODES[node][0] - lat) ** 2 + (NODES[node][1] - lng) ** 2)
+
+    def display_route(self) -> list[list[float]]:
+        if self.paused and self.path and self.indices:
+            return [[lat, lng] for lat, lng in self.path[:self.indices[0] + 1]]
+        return self.route_coordinates
+
     def snapshot(self) -> dict:
-        return {"vehicles": self.vehicles(), "simulation": self.status(), "current_route": self.route_coordinates}
+        return {"vehicles": self.vehicles(), "simulation": self.status(), "current_route": self.display_route()}
 
 
 demo_fleet = DemoFleetReplay()

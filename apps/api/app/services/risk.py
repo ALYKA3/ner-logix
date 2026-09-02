@@ -98,6 +98,16 @@ def calculate_road_risk(road: dict, live: dict, incidents: list[Any]) -> dict:
             "incidents": [{"id": _value(item, "id"), "source": _value(item, "source"), "verified": bool(_value(item, "verified"))} for item in relevant],
             "corridor_registry": "NER-LOGIX road identifiers and WGS84 geometry",
         },
+        "hazard_locations": [
+            {
+                "incident_id": _value(item, "id"),
+                "lat": _value(item, "lat"),
+                "lng": _value(item, "lng"),
+                "source": _value(item, "source"),
+            }
+            for item in trusted
+            if _value(item, "lat") is not None and _value(item, "lng") is not None
+        ],
     }
 
 

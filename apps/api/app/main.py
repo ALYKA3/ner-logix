@@ -21,17 +21,20 @@ from .models import DriverEvent, Incident, IncidentPhoto, Reroute, RiskSnapshot
 from .schemas import (
     AlternateRouteRequest,
     ApproveRerouteRequest,
+    ConfirmFieldReportRequest,
     DriverReportRequest,
     FieldVerificationRequest,
     IncidentCreate,
     LoginRequest,
+    RoadBlockRequest,
     RiskRequest,
     SimulationConfigRequest,
     VehicleTelemetryRequest,
 )
 from .services.risk import BASE_ROADS, mission_priority, risk_engine
+from .services.exposure import assess_route_exposure
 from .services.road_geometry import road_geometry
-from .services.routing import NODES, ranked_routes, safest_route
+from .services.routing import EDGES, NODES, ranked_routes, safest_route
 from .services.simulation import VEHICLE_PATH, demo_fleet, fleet_state, run_demo_replay, run_simulation
 from .websocket import manager
 
@@ -39,6 +42,9 @@ settings = get_settings()
 upload_path = Path(settings.upload_dir)
 upload_path.mkdir(parents=True, exist_ok=True)
 weather_adapter = OpenMeteoAdapter(settings.live_data_timeout_seconds) if settings.live_data_enabled else None
+latest_route_exposure: dict | None = None
+last_auto_reroute_signature: tuple | None = None
+last_auto_reroute: dict | None = None
 
 
 def active_incidents() -> list[Incident]:
@@ -59,11 +65,13 @@ def persist_risk_snapshots(roads: list[dict]) -> None:
         db.commit()
 
 
-async def refresh_live_risk(broadcast: bool = True) -> list[dict]:
+async def refresh_live_risk(broadcast: bool = True, evaluate_exposure: bool = True) -> list[dict]:
     roads = await risk_engine.refresh(active_incidents(), weather_adapter)
     persist_risk_snapshots(roads)
     if broadcast:
         await manager.broadcast({"type": "roads.risk_updated", "data": roads})
+    if evaluate_exposure:
+        await handle_route_exposure(roads)
     return roads
 
 
@@ -142,11 +150,135 @@ def serialize_reroute(item: Reroute) -> dict:
         "route_name": item.route_name, "reason": item.reason,
         "distance_km": item.distance_km, "eta_minutes": item.eta_minutes,
         "risk_score": item.risk_score, "coordinates": item.coordinates,
+        "road_ids": route_road_ids(item.route_name),
         "approved_by": item.approved_by,
         "approved_at": item.approved_at.isoformat() if item.approved_at else None,
         "accepted_at": item.accepted_at.isoformat() if item.accepted_at else None,
         "created_at": item.created_at.isoformat(),
     }
+
+
+def archive_reroutes(db: Session, vehicle_id: str, include_accepted: bool = False) -> int:
+    """Archive superseded route decisions so only the current mission state is shown."""
+    statuses = ["PENDING_APPROVAL", "APPROVED"]
+    if include_accepted:
+        statuses.append("DRIVER_ACCEPTED")
+    items = list(db.scalars(select(Reroute).where(
+        Reroute.vehicle_id == vehicle_id,
+        Reroute.status.in_(statuses),
+    )))
+    for item in items:
+        item.status = "ARCHIVED"
+    return len(items)
+
+
+async def create_alternate_route(payload: AlternateRouteRequest, db: Session) -> dict:
+    """Persist one road-snapped route after removing every avoided graph edge."""
+    live_risks = {road["id"]: road["risk_score"] for road in risk_engine.roads()}
+    route = safest_route(payload.start_node, payload.destination_node, payload.avoid_road_ids, live_risks)
+    geometry = await road_geometry.snap_segments(route["coordinates"])
+    route["coordinates"] = geometry.coordinates
+    route["geometry_source"] = geometry.source
+    if geometry.distance_km:
+        route["distance_km"] = geometry.distance_km
+    if geometry.eta_minutes:
+        route["eta_minutes"] = geometry.eta_minutes
+    archive_reroutes(db, payload.vehicle_id, include_accepted=True)
+    reroute = Reroute(vehicle_id=payload.vehicle_id, status="PENDING_APPROVAL", **{
+        key: route[key] for key in (
+            "route_name", "reason", "distance_km", "eta_minutes", "risk_score", "coordinates"
+        )
+    })
+    db.add(reroute)
+    db.commit()
+    db.refresh(reroute)
+    fleet_state.reroute_status = "PENDING_APPROVAL"
+    fleet_state.last_instruction = "Safer route proposed; awaiting authority approval"
+    result = {
+        **serialize_reroute(reroute),
+        "algorithm": route["algorithm"],
+        "road_ids": route["road_ids"],
+        "geometry_source": route["geometry_source"],
+    }
+    await manager.broadcast({"type": "reroute.proposed", "data": result})
+    return result
+
+
+def current_route_exposure(roads: list[dict]) -> dict | None:
+    if demo_fleet.running and demo_fleet.path and demo_fleet.route_road_ids:
+        vehicles = demo_fleet.vehicles()
+        if not vehicles:
+            return None
+        selected = next((vehicle for vehicle in vehicles if vehicle["vehicle_id"] == "MED-001"), vehicles[0])
+        dense_route = [[lat, lng] for lat, lng in demo_fleet.path]
+        return assess_route_exposure(selected, dense_route, demo_fleet.route_road_ids, roads)
+    return assess_route_exposure(
+        fleet_state.vehicle(),
+        fleet_state.assigned_route_coordinates,
+        fleet_state.assigned_route_road_ids,
+        roads,
+    )
+
+
+async def handle_route_exposure(roads: list[dict]) -> dict | None:
+    """Warn early, prepare a detour, and hold before a critical hazard is reached."""
+    global latest_route_exposure, last_auto_reroute_signature, last_auto_reroute
+    exposure = current_route_exposure(roads)
+    latest_route_exposure = exposure
+    if not exposure:
+        last_auto_reroute_signature = None
+        last_auto_reroute = None
+        return None
+    if exposure["action"] not in {"WARN_AND_PREPARE_REROUTE", "HOLD_AND_REROUTE"}:
+        return exposure
+
+    avoid_road_ids = sorted({
+        road["id"] for road in roads if road["status"] == "BLOCKED" or road["risk_score"] >= 75
+    })
+    if demo_fleet.running:
+        start_node = demo_fleet.nearest_node_for_vehicle(exposure["vehicle_id"])
+        destination_node = demo_fleet.destination_node
+    else:
+        vehicle = fleet_state.vehicle()
+        start_node = min(NODES, key=lambda node: (NODES[node][0] - vehicle["lat"]) ** 2 + (NODES[node][1] - vehicle["lng"]) ** 2)
+        destination_node = "F"
+    signature = (exposure["vehicle_id"], start_node, destination_node, tuple(avoid_road_ids))
+    if exposure["action"] == "HOLD_AND_REROUTE":
+        if demo_fleet.running and not demo_fleet.paused:
+            demo_fleet.pause_for_reroute(exposure["road_id"])
+            await manager.broadcast({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
+        elif not demo_fleet.running and fleet_state.status_override != "HOLD_POSITION":
+            vehicle = fleet_state.hold(f"STOP: {exposure['road_id']} hazard is {exposure['distance_ahead_km']} km ahead. Await the safer route.")
+            await manager.broadcast({"type": "vehicle.hold", "data": vehicle})
+    if signature != last_auto_reroute_signature:
+        try:
+            with SessionLocal() as db:
+                last_auto_reroute = await create_alternate_route(AlternateRouteRequest(
+                    vehicle_id=exposure["vehicle_id"],
+                    start_node=start_node,
+                    destination_node=destination_node,
+                    avoid_road_ids=avoid_road_ids,
+                ), db)
+        except ValueError as exc:
+            last_auto_reroute = None
+            exposure["route_error"] = str(exc)
+            if exposure["action"] == "HOLD_AND_REROUTE":
+                if demo_fleet.running:
+                    demo_fleet.mark_no_safe_route()
+                else:
+                    fleet_state.hold("No safe route remains; hold at a verified safe point")
+        last_auto_reroute_signature = signature
+    exposure["reroute"] = last_auto_reroute
+    latest_route_exposure = exposure
+    await manager.broadcast({"type": "route.hazard_ahead", "data": exposure})
+    return exposure
+
+
+def route_road_ids(route_name: str) -> list[str]:
+    node_by_name = {value[2]: key for key, value in NODES.items()}
+    nodes = [node_by_name.get(name.strip()) for name in route_name.split("→")]
+    edge_lookup = {frozenset((left, right)): road_id for left, right, _, _, road_id in EDGES}
+    return [edge_lookup[frozenset((left, right))] for left, right in zip(nodes, nodes[1:]) if left and right]
 
 
 @asynccontextmanager
@@ -292,22 +424,46 @@ async def bootstrap(db: Session = Depends(get_db), _: dict = Depends(current_use
                 latest_reroute.eta_minutes = aligned_reroute.eta_minutes
                 db.commit()
                 db.refresh(latest_reroute)
-    blocked = {item.road_id for item in incidents if item.severity in {"HIGH", "CRITICAL"}}
+    road_assessments = risk_engine.roads()
+    blocked = {road["id"] for road in road_assessments if road["status"] == "BLOCKED"}
     replay_vehicles = demo_fleet.vehicles()
     selected_vehicle = replay_vehicles[0] if replay_vehicles else fleet_state.vehicle()
-    assigned_waypoints = [[NODES[node][0], NODES[node][1]] for node in ("A", "B", "C", "E", "F")]
-    assigned_geometry = await road_geometry.snap_segments(assigned_waypoints)
+    try:
+        assigned_route = safest_route(
+            "A", "F", list(blocked), {road["id"]: road["risk_score"] for road in road_assessments}
+        )
+        assigned_geometry = await road_geometry.snap_segments(assigned_route["coordinates"])
+    except ValueError:
+        assigned_geometry = None
+    accepted_route_is_safe = bool(
+        latest_reroute
+        and latest_reroute.status == "DRIVER_ACCEPTED"
+        and not blocked.intersection(route_road_ids(latest_reroute.route_name))
+    )
+    if demo_fleet.running:
+        current_route = demo_fleet.display_route()
+        current_route_source = "DEMO_GPS_REPLAY"
+    elif accepted_route_is_safe:
+        current_route = latest_reroute.coordinates
+        current_route_source = "DRIVER_ACCEPTED_REROUTE"
+    elif blocked and latest_reroute and latest_reroute.status in {"PENDING_APPROVAL", "APPROVED"}:
+        current_route = []
+        current_route_source = "HOLDING_FOR_SAFE_REROUTE"
+    else:
+        current_route = assigned_geometry.coordinates if assigned_geometry else []
+        current_route_source = assigned_geometry.source if assigned_geometry else "NO_SAFE_ROUTE"
     return {
         "region": {"name": "Assam demo corridor", "center": [26.135, 91.95], "zoom": 10},
         "vehicle": selected_vehicle,
         "vehicles": replay_vehicles or [selected_vehicle],
         "simulation": demo_fleet.status(),
         "network_nodes": [{"id": key, "name": value[2], "lat": value[0], "lng": value[1]} for key, value in NODES.items()],
-        "roads": risk_engine.roads(),
+        "roads": road_assessments,
         "incidents": [serialize_incident(item) for item in incidents],
         "reroute": serialize_reroute(latest_reroute) if latest_reroute else None,
-        "current_route": demo_fleet.route_coordinates if demo_fleet.running else assigned_geometry.coordinates,
-        "current_route_source": "DEMO_GPS_REPLAY" if demo_fleet.running else assigned_geometry.source,
+        "current_route": current_route,
+        "current_route_source": current_route_source,
+        "route_exposure": current_route_exposure(road_assessments),
         "network_summary": {
             "active_vehicles": len(replay_vehicles) if replay_vehicles else 1,
             "critical_deliveries": len([item for item in replay_vehicles if item["priority"] == "CRITICAL"]) if replay_vehicles else 1,
@@ -343,6 +499,7 @@ def simulation_options(_: dict = Depends(require_roles("ADMIN"))) -> dict:
 @app.post("/api/v1/simulation/start")
 async def start_simulation(
     payload: SimulationConfigRequest,
+    db: Session = Depends(get_db),
     _: dict = Depends(require_roles("ADMIN")),
 ) -> dict:
     try:
@@ -358,9 +515,13 @@ async def start_simulation(
             payload.interval_seconds,
             geometry.coordinates,
             geometry.distance_km or route["distance_km"],
+            route["road_ids"],
         )
+        archive_reroutes(db, "MED-001", include_accepted=True)
+        db.commit()
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await manager.broadcast({"type": "reroute.reset", "data": None})
     await manager.broadcast({"type": "simulation.started", "data": snapshot})
     return snapshot
 
@@ -413,11 +574,15 @@ async def resolve_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     incident.status = "RESOLVED"
+    archived_reroutes = archive_reroutes(db, "MED-001")
     db.commit()
     db.refresh(incident)
     result = serialize_incident(incident)
     result["resolved_by"] = user["id"]
+    result["archived_reroutes"] = archived_reroutes
     await manager.broadcast({"type": "incident.resolved", "data": result})
+    if archived_reroutes:
+        await manager.broadcast({"type": "reroute.reset", "data": None})
     await refresh_live_risk()
     return result
 
@@ -433,18 +598,195 @@ async def reopen_road(
     active = list(db.scalars(select(Incident).where(Incident.road_id == road_id, Incident.status == "ACTIVE")))
     for incident in active:
         incident.status = "RESOLVED"
+    archived_reroutes = archive_reroutes(db, "MED-001")
     db.commit()
     result = {
         "road_id": road_id,
         "status": "REOPENED",
         "resolved_incidents": len(active),
+        "archived_reroutes": archived_reroutes,
         "reopened_by": user["id"],
         "reopened_at": datetime.now(timezone.utc).isoformat(),
     }
     await manager.broadcast({"type": "road.reopened", "data": result})
-    roads = await refresh_live_risk()
+    if archived_reroutes:
+        await manager.broadcast({"type": "reroute.reset", "data": None})
+    roads = await refresh_live_risk(evaluate_exposure=False)
     result["road"] = next(road for road in roads if road["id"] == road_id)
+    result["roads"] = roads
+    result["reroute"] = None
+    result["resumed_current_route"] = False
+    blocked_road_ids = [road["id"] for road in roads if road["status"] == "BLOCKED"]
+    if demo_fleet.running and demo_fleet.paused:
+        route_still_blocked = any(item in blocked_road_ids for item in demo_fleet.route_road_ids)
+        if route_still_blocked:
+            try:
+                result["reroute"] = await create_alternate_route(AlternateRouteRequest(
+                    vehicle_id="MED-001",
+                    start_node=demo_fleet.nearest_node_for_vehicle("MED-001"),
+                    destination_node=demo_fleet.destination_node,
+                    avoid_road_ids=blocked_road_ids,
+                ), db)
+            except ValueError:
+                demo_fleet.mark_no_safe_route()
+        else:
+            result["resumed_current_route"] = True
+            demo_fleet.resume_current_route()
+        await manager.broadcast({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
+    if demo_fleet.running:
+        result["current_route"] = demo_fleet.display_route()
+    else:
+        try:
+            route = safest_route("A", "F", blocked_road_ids, {road["id"]: road["risk_score"] for road in roads})
+            geometry = await road_geometry.snap_segments(route["coordinates"])
+            result["current_route"] = geometry.coordinates
+        except ValueError:
+            result["current_route"] = []
     return result
+
+
+@app.post("/api/v1/roads/{road_id}/block", status_code=201)
+async def block_road(
+    road_id: str,
+    payload: RoadBlockRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_roles("ADMIN")),
+) -> dict:
+    """Close one complete registered road edge and immediately calculate a safe alternative."""
+    registered = next((road for road in BASE_ROADS if road["id"] == road_id), None)
+    if not registered:
+        raise HTTPException(status_code=404, detail="Road segment not found")
+
+    active_closure = db.scalars(select(Incident).where(
+        Incident.road_id == road_id,
+        Incident.status == "ACTIVE",
+        Incident.source == "control_room",
+        Incident.severity.in_(("HIGH", "CRITICAL")),
+    ).order_by(Incident.id.desc())).first()
+    if active_closure is None:
+        current_road = next((road for road in risk_engine.roads() if road["id"] == road_id), registered)
+        coordinates = current_road["coordinates"]
+        midpoint = coordinates[len(coordinates) // 2]
+        active_closure = Incident(
+            road_id=road_id,
+            incident_type="BLOCKAGE",
+            severity="CRITICAL",
+            description=payload.description,
+            lat=midpoint[0],
+            lng=midpoint[1],
+            source="control_room",
+            verified=True,
+            status="ACTIVE",
+            reported_road_status="BLOCKED",
+            affected_direction="BOTH",
+            vehicle_access="NONE",
+        )
+        db.add(active_closure)
+        db.commit()
+        db.refresh(active_closure)
+        await manager.broadcast({"type": "incident.created", "data": serialize_incident(active_closure)})
+
+    affected_replay = demo_fleet.running and road_id in demo_fleet.route_road_ids
+    if affected_replay:
+        demo_fleet.pause_for_reroute(road_id)
+        await manager.broadcast({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
+
+    roads = await refresh_live_risk(evaluate_exposure=False)
+    blocked_road_ids = [road["id"] for road in roads if road["status"] == "BLOCKED"]
+    blocked_road = next(road for road in roads if road["id"] == road_id)
+    reroute = None
+    route_error = None
+    try:
+        reroute = await create_alternate_route(AlternateRouteRequest(
+            vehicle_id=payload.vehicle_id,
+            start_node=demo_fleet.nearest_node_for_vehicle(payload.vehicle_id) if demo_fleet.running else payload.start_node,
+            destination_node=demo_fleet.destination_node if demo_fleet.running else payload.destination_node,
+            avoid_road_ids=blocked_road_ids,
+        ), db)
+    except ValueError as exc:
+        route_error = str(exc)
+        fleet_state.reroute_status = "NO_SAFE_ROUTE"
+        fleet_state.last_instruction = "No safe route remains; hold at a verified safe point"
+        if affected_replay:
+            demo_fleet.mark_no_safe_route()
+            await manager.broadcast({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
+
+    route_exposure = current_route_exposure(roads)
+    if route_exposure:
+        route_exposure["reroute"] = reroute
+        route_exposure["route_error"] = route_error
+        await manager.broadcast({"type": "route.hazard_ahead", "data": route_exposure})
+
+    result = {
+        "status": "BLOCKED_AND_REROUTED" if reroute else "BLOCKED_NO_SAFE_ROUTE",
+        "road_id": road_id,
+        "closure_scope": "ENTIRE_REGISTERED_ROAD_EDGE",
+        "blocked_from": registered["coordinates"][0],
+        "blocked_to": registered["coordinates"][-1],
+        "blocked_road_ids": blocked_road_ids,
+        "road": blocked_road,
+        "roads": roads,
+        "incident": serialize_incident(active_closure),
+        "reroute": reroute,
+        "route_error": route_error,
+        "blocked_by": user["id"],
+        "vehicle_held": affected_replay,
+        "vehicle": demo_fleet.vehicles()[0] if affected_replay and demo_fleet.vehicles() else fleet_state.vehicle(),
+        "current_route": demo_fleet.display_route() if demo_fleet.running else [],
+        "route_exposure": route_exposure,
+    }
+    await manager.broadcast({"type": "road.blocked", "data": result})
+    return result
+
+
+@app.post("/api/v1/incidents/{incident_id}/confirm-closure", status_code=201)
+async def confirm_field_report_closure(
+    incident_id: int,
+    payload: ConfirmFieldReportRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_roles("ADMIN")),
+) -> dict:
+    """Accept a Field Officer report, map it, and issue one end-to-end road closure."""
+    report = db.get(Incident, incident_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Field report not found")
+    if report.source == "control_room":
+        raise HTTPException(status_code=422, detail="This is already a Control Room incident")
+    if report.status != "ACTIVE":
+        raise HTTPException(status_code=409, detail="This field report is no longer awaiting action")
+    if report.verified:
+        raise HTTPException(status_code=409, detail="This field report was already confirmed")
+
+    registered = next((road for road in BASE_ROADS if road["id"] == payload.road_id), None)
+    if not registered:
+        raise HTTPException(status_code=404, detail="Select a registered road segment")
+
+    closure = await block_road(
+        payload.road_id,
+        RoadBlockRequest(
+            vehicle_id=payload.vehicle_id,
+            start_node=payload.start_node,
+            destination_node=payload.destination_node,
+            description=(
+                f"Control Room confirmed Field Officer report INC-{report.id}: "
+                f"{report.description}"
+            ),
+        ),
+        db,
+        user,
+    )
+
+    report.road_id = payload.road_id
+    report.verified = True
+    report.status = "RESOLVED"
+    report.reported_road_status = "BLOCKED"
+    db.commit()
+    db.refresh(report)
+    reviewed_report = serialize_incident(report)
+    reviewed_report["confirmed_by"] = user["id"]
+    closure["reviewed_report"] = reviewed_report
+    await manager.broadcast({"type": "field.report_confirmed", "data": reviewed_report})
+    return closure
 
 
 @app.post("/api/v1/routes/alternate", status_code=201)
@@ -454,35 +796,9 @@ async def alternate_route(
     _: dict = Depends(require_roles("ADMIN")),
 ) -> dict:
     try:
-        live_risks = {road["id"]: road["risk_score"] for road in risk_engine.roads()}
-        route = safest_route(payload.start_node, payload.destination_node, payload.avoid_road_ids, live_risks)
-        geometry = await road_geometry.snap_segments(route["coordinates"])
-        route["coordinates"] = geometry.coordinates
-        route["geometry_source"] = geometry.source
-        if geometry.distance_km:
-            route["distance_km"] = geometry.distance_km
-        if geometry.eta_minutes:
-            route["eta_minutes"] = geometry.eta_minutes
+        return await create_alternate_route(payload, db)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    reroute = Reroute(vehicle_id=payload.vehicle_id, status="PENDING_APPROVAL", **{
-        key: route[key] for key in (
-            "route_name", "reason", "distance_km", "eta_minutes", "risk_score", "coordinates"
-        )
-    })
-    db.add(reroute)
-    db.commit()
-    db.refresh(reroute)
-    fleet_state.reroute_status = "PENDING_APPROVAL"
-    fleet_state.last_instruction = "Safer route proposed; awaiting authority approval"
-    result = {
-        **serialize_reroute(reroute),
-        "algorithm": route["algorithm"],
-        "road_ids": route["road_ids"],
-        "geometry_source": route["geometry_source"],
-    }
-    await manager.broadcast({"type": "reroute.proposed", "data": result})
-    return result
 
 
 @app.get("/api/v1/routes/monitor")
@@ -501,7 +817,7 @@ def monitor_routes(
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "refresh_seconds": settings.risk_refresh_seconds,
         "risk_engine_refresh": risk_engine.last_refresh,
-        "algorithm": "All simple paths ranked by distance + continuously recalculated road risk; blocked paths rank last",
+        "algorithm": "All paths ranked by risk-adjusted travel cost; blocked paths are never recommended",
     }
 
 
@@ -522,6 +838,9 @@ async def approve_reroute(
     db.refresh(reroute)
     fleet_state.reroute_status = "AWAITING_DRIVER"
     fleet_state.last_instruction = "New safe route approved — review and accept"
+    if demo_fleet.running and demo_fleet.paused:
+        demo_fleet.mark_awaiting_driver()
+        await manager.broadcast({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
     result = serialize_reroute(reroute)
     await manager.broadcast({"type": "reroute.approved", "data": result})
     return result
@@ -570,6 +889,16 @@ async def driver_accept(
     fleet_state.last_instruction = f"Follow approved route: {reroute.route_name}"
     result = serialize_reroute(reroute)
     await manager.broadcast({"type": "reroute.driver_accepted", "data": result})
+    if demo_fleet.running:
+        snapshot = demo_fleet.apply_reroute(
+            reroute.coordinates,
+            reroute.distance_km,
+            route_road_ids(reroute.route_name),
+        )
+        await manager.broadcast({"type": "fleet.snapshot", "data": snapshot})
+    else:
+        vehicle = fleet_state.apply_reroute(reroute.coordinates, route_road_ids(reroute.route_name))
+        await manager.broadcast({"type": "vehicle.location", "data": vehicle})
     return result
 
 
@@ -613,6 +942,7 @@ async def ingest_vehicle_telemetry(
         payload.lat, payload.lng, payload.speed_kmph, payload.accuracy_m, payload.captured_at
     )
     await manager.broadcast({"type": "vehicle.location", "data": vehicle})
+    await handle_route_exposure(risk_engine.roads())
     return vehicle
 
 
@@ -689,14 +1019,16 @@ async def fleet_socket(websocket: WebSocket) -> None:
         await websocket.close(code=4401)
         return
     await manager.connect(websocket, subprotocol="ner-logix")
-    replay_vehicles = demo_fleet.vehicles()
-    await websocket.send_json({"type": "connected", "data": replay_vehicles[0] if replay_vehicles else fleet_state.vehicle()})
-    if replay_vehicles:
-        await websocket.send_json({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
     try:
+        replay_vehicles = demo_fleet.vehicles()
+        await websocket.send_json({"type": "connected", "data": replay_vehicles[0] if replay_vehicles else fleet_state.vehicle()})
+        if replay_vehicles:
+            await websocket.send_json({"type": "fleet.snapshot", "data": demo_fleet.snapshot()})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         manager.disconnect(websocket)
 
 

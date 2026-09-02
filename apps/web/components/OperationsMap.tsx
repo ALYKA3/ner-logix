@@ -49,12 +49,15 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
   const mapRef = useRef<any>(null);
   const layersRef = useRef<any>(null);
   const lastFitKeyRef = useRef<string>("");
+  const openRoadIdRef = useRef<string | null>(null);
+  const redrawingRef = useRef(false);
 
   const highestRisk = useMemo(() => Math.max(0, ...roads.map((road) => road.risk_score)), [roads]);
   const blockedCount = useMemo(() => roads.filter((road) => road.status === "BLOCKED").length, [roads]);
   const liveCount = useMemo(() => roads.filter((road) => road.data_status === "LIVE").length, [roads]);
   const inPilotCorridor = useMemo(() => vehicle.lat >= 25.7 && vehicle.lat <= 26.6 && vehicle.lng >= 91.3 && vehicle.lng <= 92.6, [vehicle.lat, vehicle.lng]);
   const displayedVehicles = useMemo(() => compact ? [vehicle] : vehicles?.length ? vehicles : [vehicle], [compact, vehicle, vehicles]);
+  const showAlternativeRoute = Boolean(reroute?.coordinates?.length && ["PENDING_APPROVAL", "APPROVED"].includes(reroute.status));
 
   useEffect(() => {
     let disposed = false;
@@ -93,6 +96,19 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
           layers: [satellite],
         }).setView([26.135, 91.95], navigation ? 13 : compact ? 10 : 11);
 
+        // Stable pane ordering prevents overlapping routes from hiding each other:
+        // roads < reroute < current route < blocked roads < click targets.
+        [
+          ["roadStatePane", "410"],
+          ["reroutePane", "420"],
+          ["currentRoutePane", "430"],
+          ["blockedRoadPane", "440"],
+          ["roadInteractionPane", "450"],
+        ].forEach(([name, zIndex]) => {
+          const pane = mapRef.current!.createPane(name);
+          pane.style.zIndex = zIndex;
+        });
+
         L.control.zoom({ position: "topright" }).addTo(mapRef.current);
         if (!compact) {
           L.control.layers({ "Satellite intelligence": satellite, Topographic: topographic, Streets: street }, undefined, {
@@ -100,18 +116,35 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
             collapsed: true,
           }).addTo(mapRef.current);
         }
+        const syncLabelVisibility = () => container.current?.classList.toggle("show-map-labels", mapRef.current?.getZoom() >= 11);
+        mapRef.current.on("zoomend", syncLabelVisibility);
+        syncLabelVisibility();
       }
 
+      const roadPopupToRestore = openRoadIdRef.current;
+      redrawingRef.current = true;
       if (layersRef.current) layersRef.current.clearLayers();
       const group = L.layerGroup().addTo(mapRef.current);
       layersRef.current = group;
+      const roadTargets = new Map<string, any>();
+
+      if (currentRoute.length) {
+        const route = currentRoute as [number, number][];
+        L.polyline(route, { pane: "currentRoutePane", color: "#00112d", weight: 16, opacity: 0.86, lineCap: "round", lineJoin: "round", interactive: false }).addTo(group);
+        L.polyline(route, { pane: "currentRoutePane", color: "#0077ff", weight: 10, opacity: 0.42, lineCap: "round", lineJoin: "round", interactive: false }).addTo(group);
+        L.polyline(route, { pane: "currentRoutePane", color: "#28a9ff", weight: 6, opacity: 1, lineCap: "round", lineJoin: "round", className: "current-route-line", interactive: false })
+          .bindTooltip("ROAD-SNAPPED CURRENT ROUTE · MED-001", { sticky: true, className: "intel-tooltip route-tooltip" })
+          .addTo(group);
+      }
 
       roads.forEach((road) => {
         const coordinates = road.coordinates as [number, number][];
         const color = roadColor(road);
-        L.polyline(coordinates, { color: "#020713", weight: road.status === "BLOCKED" ? 15 : 11, opacity: 0.8, lineCap: "round", interactive: false }).addTo(group);
-        L.polyline(coordinates, { color, weight: road.status === "BLOCKED" ? 11 : 7, opacity: 0.35, lineCap: "round", interactive: false }).addTo(group);
+        const roadPane = road.status === "BLOCKED" ? "blockedRoadPane" : "roadStatePane";
+        L.polyline(coordinates, { pane: roadPane, color: "#020713", weight: road.status === "BLOCKED" ? 15 : 11, opacity: 0.8, lineCap: "round", interactive: false }).addTo(group);
+        L.polyline(coordinates, { pane: roadPane, color, weight: road.status === "BLOCKED" ? 11 : 7, opacity: 0.35, lineCap: "round", interactive: false }).addTo(group);
         const roadLine = L.polyline(coordinates, {
+          pane: roadPane,
           color,
           weight: road.status === "BLOCKED" ? 6 : 4,
           opacity: 1,
@@ -138,7 +171,10 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
             action.textContent = road.status === "BLOCKED" ? "REOPENING & RERANKING…" : "BLOCKING & RERANKING…";
             try {
               const succeeded = road.status === "BLOCKED" ? await onRoadReopen(road) : await onRoadBlock(road);
-              if (succeeded !== false) mapRef.current?.closePopup();
+              if (succeeded !== false) {
+                openRoadIdRef.current = null;
+                mapRef.current?.closePopup();
+              }
             } catch {
               // Parent callbacks normally convert failures to a dashboard notice.
               // This final guard prevents async DOM handlers from opening the dev overlay.
@@ -146,29 +182,34 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
           };
           popup.append(heading, detail, hint, action);
           L.DomEvent.disableClickPropagation(popup);
-          L.polyline(coordinates, {
+          const touchTarget = L.polyline(coordinates, {
+            pane: "roadInteractionPane",
             color,
             weight: 22,
             opacity: 0.01,
             lineCap: "round",
             className: "road-touch-target",
           }).bindPopup(popup, { className: "road-action-popup", closeButton: true, minWidth: 245 }).addTo(group);
+          touchTarget.on("popupopen", () => { openRoadIdRef.current = road.id; });
+          touchTarget.on("popupclose", () => {
+            if (!redrawingRef.current && openRoadIdRef.current === road.id) openRoadIdRef.current = null;
+          });
+          roadTargets.set(road.id, touchTarget);
         }
       });
 
-      if (currentRoute.length) {
-        const route = currentRoute as [number, number][];
-        L.polyline(route, { color: "#00112d", weight: 16, opacity: 0.86, lineCap: "round", lineJoin: "round", interactive: false }).addTo(group);
-        L.polyline(route, { color: "#0077ff", weight: 10, opacity: 0.42, lineCap: "round", lineJoin: "round", interactive: false }).addTo(group);
-        L.polyline(route, { color: "#28a9ff", weight: 6, opacity: 1, lineCap: "round", lineJoin: "round", className: "current-route-line", interactive: false })
-          .bindTooltip("ROAD-SNAPPED CURRENT ROUTE · MED-001", { sticky: true, className: "intel-tooltip route-tooltip" })
-          .addTo(group);
+      if (roadPopupToRestore) {
+        const target = roadTargets.get(roadPopupToRestore);
+        if (target) target.openPopup();
+        else openRoadIdRef.current = null;
       }
+      redrawingRef.current = false;
 
-      if (reroute?.coordinates?.length) {
+      if (showAlternativeRoute && reroute?.coordinates?.length) {
         const alternate = reroute.coordinates as [number, number][];
-        L.polyline(alternate, { color: "#003d2d", weight: 12, opacity: 0.72, lineCap: "round", interactive: false }).addTo(group);
+        L.polyline(alternate, { pane: "reroutePane", color: "#003d2d", weight: 12, opacity: 0.72, lineCap: "round", interactive: false }).addTo(group);
         L.polyline(alternate, {
+          pane: "reroutePane",
           color: "#2cff8b",
           weight: 5,
           dashArray: "5 10",
@@ -197,11 +238,12 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
         L.marker([incident.lat, incident.lng], {
           icon: L.divIcon({
             className: "map-icon",
-            html: `<span class="hazard-pulse"><b>!</b></span><span class="hazard-label">${verificationLabel} · ${safeType}${reportCount}</span>`,
+            html: `<span class="hazard-pulse"><b>!</b>${count > 1 ? `<small>${count}</small>` : ""}</span>`,
             iconSize: [38, 38], iconAnchor: [19, 19],
           }),
         })
           .bindPopup(`<strong>${safeType} · ${safeRoad}</strong><br/>${safeDescription}<br/>${controlRoomClosure ? "Digitally blocked by authenticated Control Room" : incident.verified ? "Field verified" : "Pending verification"}${reportCount}`)
+          .bindTooltip(`${safeRoad} · ${verificationLabel}${reportCount}`, { direction: "top", offset: [0, -18], className: "intel-tooltip hazard-tooltip" })
           .addTo(group);
       });
 
@@ -248,7 +290,7 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
       });
       if (!compact || inPilotCorridor) {
         currentRoute.forEach((point) => points.push(point as [number, number]));
-        reroute?.coordinates?.forEach((point) => points.push(point as [number, number]));
+        if (showAlternativeRoute) reroute?.coordinates?.forEach((point) => points.push(point as [number, number]));
         roads.forEach((road) => road.coordinates.forEach((point) => points.push(point as [number, number])));
       }
       if (navigation) {
@@ -256,7 +298,7 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
       } else if (points.length > 1) {
         const first = currentRoute[0];
         const last = currentRoute[currentRoute.length - 1];
-        const fitKey = `${currentRoute.length}:${first?.join(",")}:${last?.join(",")}:${reroute?.id ?? "none"}`;
+        const fitKey = `${currentRoute.length}:${first?.join(",")}:${last?.join(",")}:${showAlternativeRoute ? reroute?.id : "none"}`;
         // Live GPS/risk updates redraw layers, but must not override the operator's zoom.
         if (lastFitKeyRef.current !== fitKey) {
           mapRef.current.fitBounds(L.latLngBounds(points), { padding: compact ? [16, 16] : [46, 46] });
@@ -268,7 +310,7 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
 
     setup();
     return () => { disposed = true; };
-  }, [vehicle, displayedVehicles, roads, incidents, reroute, currentRoute, compact, navigation, inPilotCorridor, onRoadBlock, onRoadReopen]);
+  }, [vehicle, displayedVehicles, roads, incidents, reroute, currentRoute, compact, navigation, inPilotCorridor, onRoadBlock, onRoadReopen, showAlternativeRoute]);
 
   useEffect(() => () => {
     mapRef.current?.remove();
@@ -291,7 +333,7 @@ export default function OperationsMap({ vehicle, vehicles, roads, incidents, rer
     {!compact && <>
       <div className="map-command-title"><small>NER-LOGIX · CORRIDOR INTELLIGENCE</small><b>NORTHEAST INDIA</b><span>ASSAM PILOT</span></div>
       <div className="map-data-gauge">
-        <span><small>ROAD RISK</small><b>{highestRisk}</b><i className={highestRisk >= 75 ? "critical" : highestRisk >= 50 ? "high" : "nominal"}/></span>
+        <span><small>HIGHEST RISK</small><b>{highestRisk}</b><i className={highestRisk >= 75 ? "critical" : highestRisk >= 50 ? "high" : "nominal"}/></span>
         <span><small>GPS SPEED</small><b>{Math.round(vehicle.speed_kmph)}</b><em>km/h</em></span>
       </div>
       <div className={`map-feed-status${inPilotCorridor ? "" : " gps-anomaly"}`}><i/><span><b>{liveCount}/{roads.length}</b> LIVE RISK FEEDS</span><span><b>{blockedCount}</b> BLOCKED</span>{!inPilotCorridor && <span><b>GPS OUTSIDE PILOT</b></span>}</div>

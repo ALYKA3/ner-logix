@@ -73,6 +73,7 @@ export type Reroute = {
   eta_minutes: number;
   risk_score: number;
   coordinates: number[][];
+  road_ids?: string[];
   approved_by?: string;
   approved_at?: string;
   accepted_at?: string;
@@ -90,20 +91,38 @@ export type Bootstrap = {
   reroute: Reroute | null;
   current_route: number[][];
   current_route_source?: string;
+  route_exposure?: RouteExposure | null;
   network_summary: Record<string, number>;
   mission_priority: number;
+};
+
+export type RouteExposure = {
+  vehicle_id: string;
+  road_id: string;
+  road_name: string;
+  risk_score: number;
+  road_status: string;
+  distance_ahead_km: number;
+  eta_to_hazard_seconds?: number | null;
+  action: "MONITOR" | "WARN_AND_PREPARE_REROUTE" | "HOLD_AND_REROUTE";
+  urgency: "ADVISORY" | "WARNING" | "CRITICAL";
+  reason: string;
+  reroute?: Reroute | null;
+  route_error?: string | null;
 };
 
 export type NetworkNode = { id: string; name: string; lat: number; lng: number };
 
 export type SimulationStatus = {
   running: boolean;
+  paused?: boolean;
   vehicle_count: number;
   source_node: string;
   source_name: string;
   destination_node: string;
   destination_name: string;
   interval_seconds: number;
+  route_road_ids?: string[];
   updated_at?: string;
   label: "DEMO GPS REPLAY";
 };

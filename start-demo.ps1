@@ -12,7 +12,8 @@ $webLog = Join-Path $runtimeRoot "web.log"
 $webErrorLog = Join-Path $runtimeRoot "web-error.log"
 
 $apiProcess = Start-Process -FilePath $venvPython -ArgumentList "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001" -WorkingDirectory $apiRoot -RedirectStandardOutput $apiLog -RedirectStandardError $apiErrorLog -WindowStyle Hidden -PassThru
-$webProcess = Start-Process -FilePath "npm.cmd" -ArgumentList "run", "dev:web", "--", "--port", "3001" -WorkingDirectory $projectRoot -RedirectStandardOutput $webLog -RedirectStandardError $webErrorLog -WindowStyle Hidden -PassThru
+$webRoot = Join-Path $projectRoot "apps\web"
+$webProcess = Start-Process -FilePath "npm.cmd" -ArgumentList "run", "dev", "--", "--port", "3001" -WorkingDirectory $webRoot -RedirectStandardOutput $webLog -RedirectStandardError $webErrorLog -WindowStyle Hidden -PassThru
 
 Write-Host "NER-LOGIX is starting..."
 Write-Host "Web:     http://localhost:3001"

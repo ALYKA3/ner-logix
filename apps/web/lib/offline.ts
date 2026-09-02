@@ -1,8 +1,11 @@
 import { API_URL, token } from "./api";
 
-type QueuedRequest = { id?: number; path: string; method: string; body: unknown; createdAt: string };
+export type QueuedRequest = { id?: number; path: string; method: string; body: any; createdAt: string; workspace?: "field"|"driver" };
 const DB_NAME = "ner-logix-offline";
 const STORE = "requests";
+
+function workspaceForPath(path:string):"field"|"driver"{return path.startsWith("/api/v1/field/")?"field":"driver"}
+function currentWorkspace():"field"|"driver"{return window.location.pathname.startsWith("/field-officer")?"field":"driver"}
 
 function database(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -17,28 +20,34 @@ export async function queueRequest(path: string, method: string, body: unknown) 
   const db = await database();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).add({ path, method, body, createdAt: new Date().toISOString() });
+    tx.objectStore(STORE).add({ path, method, body, createdAt: new Date().toISOString(), workspace: workspaceForPath(path) });
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+  });
+  window.dispatchEvent(new Event("ner-offline-queue-change"));
+}
+
+export async function queuedRequests(): Promise<QueuedRequest[]> {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(STORE).objectStore(STORE).getAll();
+    request.onsuccess = () => resolve(request.result.filter((item:QueuedRequest)=>(item.workspace||workspaceForPath(item.path))===currentWorkspace()).sort((left:QueuedRequest,right:QueuedRequest)=>right.createdAt.localeCompare(left.createdAt)));
+    request.onerror = () => reject(request.error);
   });
 }
 
 export async function pendingCount(): Promise<number> {
-  const db = await database();
-  return new Promise((resolve, reject) => {
-    const request = db.transaction(STORE).objectStore(STORE).count();
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
+  return (await queuedRequests()).length;
 }
 
 export async function flushQueue() {
   const db = await database();
-  const items = await new Promise<QueuedRequest[]>((resolve, reject) => {
+  const allItems = await new Promise<QueuedRequest[]>((resolve, reject) => {
     const request = db.transaction(STORE).objectStore(STORE).getAll();
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+  const items=allItems.filter((item)=>(item.workspace||workspaceForPath(item.path))===currentWorkspace());
   let sent = 0;
   for (const item of items) {
     let response: Response;
@@ -60,6 +69,7 @@ export async function flushQueue() {
       sent += 1;
     }
   }
+  window.dispatchEvent(new Event("ner-offline-queue-change"));
   return sent;
 }
 

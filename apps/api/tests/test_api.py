@@ -40,6 +40,22 @@ def test_vertical_slice():
         assert route_monitor.json()["refresh_seconds"] == 10
         assert route_monitor.json()["routes"][0]["route_id"] == "Route 1"
 
+        closure = client.post("/api/v1/roads/R-08/block", headers=admin_headers, json={
+            "vehicle_id": "MED-001", "start_node": "A", "destination_node": "F",
+            "description": "Officer confirmed the complete connector is impassable",
+        })
+        assert closure.status_code == 201
+        closure_data = closure.json()
+        assert closure_data["status"] == "BLOCKED_AND_REROUTED"
+        assert closure_data["closure_scope"] == "ENTIRE_REGISTERED_ROAD_EDGE"
+        assert closure_data["road"]["status"] == "BLOCKED"
+        assert closure_data["road"]["coordinates"][0] == closure_data["blocked_from"]
+        assert closure_data["road"]["coordinates"][-1] == closure_data["blocked_to"]
+        assert "R-08" in closure_data["blocked_road_ids"]
+        assert "R-08" not in closure_data["reroute"]["road_ids"]
+        reopened_connector = client.post("/api/v1/roads/R-08/reopen", headers=admin_headers)
+        assert reopened_connector.status_code == 200
+
         photo = client.post(
             "/api/v1/uploads/incident-photo", headers=field_headers,
             files={"photo": ("evidence.png", b"\x89PNG\r\n\x1a\nprototype", "image/png")},
@@ -98,6 +114,33 @@ def test_vertical_slice():
         assert abs(replay.json()["current_route"][0][1] - 91.7362) < 0.001
         assert all(item["eta_minutes"] >= 1 for item in replay.json()["vehicles"])
 
+        blocked_active_edge = client.post("/api/v1/roads/R-07/block", headers=admin_headers, json={
+            "vehicle_id": "MED-001", "description": "Bridge approach closed during active replay",
+        })
+        assert blocked_active_edge.status_code == 201
+        active_closure = blocked_active_edge.json()
+        assert active_closure["vehicle_held"] is True
+        assert active_closure["vehicle"]["status"] == "HOLD_POSITION"
+        assert active_closure["vehicle"]["speed_kmph"] == 0
+        assert "R-07" not in active_closure["reroute"]["road_ids"]
+        held_bootstrap = client.get("/api/v1/bootstrap", headers=admin_headers).json()
+        assert held_bootstrap["simulation"]["paused"] is True
+        assert all(item["speed_kmph"] == 0 for item in held_bootstrap["vehicles"])
+
+        safe_reroute_id = active_closure["reroute"]["id"]
+        client.post(f"/api/v1/reroutes/{safe_reroute_id}/approve", headers=admin_headers, json={
+            "approved_by": "Test Control Room",
+        })
+        switched = client.post(
+            f"/api/v1/driver/MED-001/routes/{safe_reroute_id}/accept", headers=driver_headers,
+        )
+        assert switched.status_code == 200
+        rerouted_bootstrap = client.get("/api/v1/bootstrap", headers=admin_headers).json()
+        assert rerouted_bootstrap["simulation"]["paused"] is False
+        assert "R-07" not in rerouted_bootstrap["simulation"]["route_road_ids"]
+        assert rerouted_bootstrap["current_route"] == active_closure["reroute"]["coordinates"]
+        client.post("/api/v1/roads/R-07/reopen", headers=admin_headers)
+
         stopped = client.post("/api/v1/simulation/stop", headers=admin_headers)
         assert stopped.status_code == 200
         assert stopped.json()["simulation"]["running"] is False
@@ -129,6 +172,25 @@ def test_vertical_slice():
         assert custom_verification.json()["road_id"] == "UNMAPPED"
         assert custom_verification.json()["incident_type"] == "CULVERT_COLLAPSE"
         assert custom_verification.json()["landmark"] == "Near Sonapur market"
+
+        field_confirm = client.post(
+            f"/api/v1/incidents/{verification.json()['id']}/confirm-closure",
+            headers=field_headers,
+            json={"road_id": "R-02"},
+        )
+        assert field_confirm.status_code == 403
+        confirmed = client.post(
+            f"/api/v1/incidents/{verification.json()['id']}/confirm-closure",
+            headers=admin_headers,
+            json={"road_id": "R-02", "vehicle_id": "MED-001", "start_node": "A", "destination_node": "F"},
+        )
+        assert confirmed.status_code == 201
+        assert confirmed.json()["closure_scope"] == "ENTIRE_REGISTERED_ROAD_EDGE"
+        assert confirmed.json()["road"]["status"] == "BLOCKED"
+        assert confirmed.json()["reviewed_report"]["verified"] is True
+        assert confirmed.json()["reviewed_report"]["status"] == "RESOLVED"
+        assert confirmed.json()["reviewed_report"]["photo_url"] == photo.json()["photo_url"]
+        assert confirmed.json()["incident"]["source"] == "control_room"
 
         field_resolve = client.post(
             f"/api/v1/incidents/{verification.json()['id']}/resolve", headers=field_headers,

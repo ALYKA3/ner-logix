@@ -23,23 +23,44 @@ export async function signIn(role: Role) {
   });
   if (!response.ok) throw new Error("Unable to sign in. Is the API running?");
   const data = await response.json();
-  localStorage.setItem("ner_token", data.access_token);
-  localStorage.setItem("ner_user", JSON.stringify(data.user));
+  // Each workspace tab needs an independent role. localStorage is shared by all
+  // tabs and caused Driver authentication to overwrite the Control Room token.
+  sessionStorage.setItem("ner_token", data.access_token);
+  sessionStorage.setItem("ner_user", JSON.stringify(data.user));
+  localStorage.removeItem("ner_token");
+  localStorage.removeItem("ner_user");
   return data;
 }
 
 export function token() {
-  return typeof window === "undefined" ? "" : localStorage.getItem("ner_token") || "";
+  return typeof window === "undefined" ? "" : sessionStorage.getItem("ner_token") || "";
+}
+
+function roleForCurrentWorkspace(): Role | null {
+  if (typeof window === "undefined") return null;
+  if (window.location.pathname.startsWith("/admin")) return "ADMIN";
+  if (window.location.pathname.startsWith("/driver")) return "DRIVER";
+  if (window.location.pathname.startsWith("/field-officer")) return "FIELD_OFFICER";
+  return null;
+}
+
+async function ensureWorkspaceToken() {
+  if (token()) return token();
+  const role = roleForCurrentWorkspace();
+  if (!role) return "";
+  await signIn(role);
+  return token();
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
+    const accessToken = await ensureWorkspaceToken();
     response = await fetch(`${API_URL}${path}`, {
       ...options,
       headers: {
         ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
-        Authorization: `Bearer ${token()}`,
+        Authorization: `Bearer ${accessToken}`,
         ...options.headers,
       },
     });
@@ -62,9 +83,18 @@ export function connectFleetSocket(onMessage: (event: { type: string; data: any 
   let stopped = false;
   let attempt = 0;
 
-  const connect = () => {
+  const connect = async () => {
     if (stopped) return;
-    socket = new WebSocket(fleetSocketUrl(), ["ner-logix", token()]);
+    let accessToken = token();
+    if (!accessToken) {
+      try { accessToken = await ensureWorkspaceToken(); }
+      catch {
+        reconnectTimer = window.setTimeout(connect, 1000);
+        return;
+      }
+    }
+    if (stopped || !accessToken) return;
+    socket = new WebSocket(fleetSocketUrl(), ["ner-logix", accessToken]);
     socket.onopen = () => { attempt = 0; onMessage({ type: "socket.online", data: true }); };
     socket.onmessage = (message) => {
       try { onMessage(JSON.parse(message.data)); }

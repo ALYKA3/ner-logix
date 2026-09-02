@@ -22,6 +22,12 @@ EDGES = [
 ]
 
 
+def _route_cost(distance: float, risk: int) -> float:
+    """Prefer a modest detour over exposing critical logistics to a risky corridor."""
+    high_risk_penalty = 18 if risk >= 75 else 7 if risk >= 50 else 0
+    return distance * (1 + (risk / 100) * 1.8) + high_risk_penalty
+
+
 def _graph(avoid: set[str], risk_by_road: dict[str, int] | None = None) -> nx.Graph:
     risk_by_road = risk_by_road or {}
     graph = nx.Graph()
@@ -33,7 +39,7 @@ def _graph(avoid: set[str], risk_by_road: dict[str, int] | None = None) -> nx.Gr
         live_risk = risk_by_road.get(road_id, risk)
         graph.add_edge(
             left, right, distance=distance, risk=live_risk, road_id=road_id,
-            weight=distance + live_risk * 0.12,
+            weight=_route_cost(distance, live_risk),
         )
     return graph
 
@@ -49,7 +55,7 @@ def safest_route(start: str, destination: str, avoid_road_ids: list[str], risk_b
         raise ValueError("No safe route is available") from exc
     roads = [graph.edges[left, right] for left, right in zip(path, path[1:])]
     distance = sum(edge["distance"] for edge in roads)
-    avg_risk = round(sum(edge["risk"] for edge in roads) / max(1, len(roads)))
+    avg_risk = round(sum(edge["risk"] * edge["distance"] for edge in roads) / max(distance, 1))
     return {
         "nodes": path,
         "road_ids": [edge["road_id"] for edge in roads],
@@ -58,8 +64,8 @@ def safest_route(start: str, destination: str, avoid_road_ids: list[str], risk_b
         "eta_minutes": round(distance / 38 * 60),
         "risk_score": avg_risk,
         "route_name": " → ".join(NODES[item][2] for item in path),
-        "reason": f"Avoids {', '.join(avoid_road_ids) or 'no roads'} and minimizes distance plus road-risk penalty",
-        "algorithm": "NetworkX Dijkstra (distance + latest live risk penalty)",
+        "reason": f"Completely avoids {', '.join(avoid_road_ids) or 'no closed roads'} and minimizes risk-adjusted travel cost",
+        "algorithm": "Risk-aware Dijkstra (distance × live-risk exposure + high-risk penalty)",
     }
 
 
@@ -91,7 +97,7 @@ def ranked_routes(
             "risk_score": weighted_risk,
             "status": status,
             "blocked_roads": blocked_roads,
-            "score": round(distance + weighted_risk * 0.12 + (1000 if blocked_roads else 0), 2),
+            "score": round(_route_cost(distance, weighted_risk) + (1000 if blocked_roads else 0), 2),
         })
     candidates.sort(key=lambda item: item["score"])
     selected = candidates[:limit]
